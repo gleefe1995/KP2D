@@ -119,6 +119,8 @@ class KeypointDecoder(nn.Module):
         x = self.upconv4_0(x)
         x = [upsample(x)]
         x += [input_features[3]]
+        
+
         x = torch.cat(x, 1)
         x = self.upconv4_1(x)
         # Layer3

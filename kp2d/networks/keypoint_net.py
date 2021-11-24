@@ -9,6 +9,9 @@ from PIL import Image
 
 from kp2d.utils.image import image_grid
 
+from kp2d.networks.pose_hrnet import get_pose_net
+
+
 
 class KeypointNet(torch.nn.Module):
     """
@@ -28,8 +31,10 @@ class KeypointNet(torch.nn.Module):
         Extra parameters
     """
 
-    def __init__(self, use_color=True, do_upsample=True, with_drop=True, do_cross=True, **kwargs):
+    def __init__(self, config,use_color=True, do_upsample=True, with_drop=True, do_cross=True, **kwargs):
         super().__init__()
+
+        self.hrnet = get_pose_net(config,is_train=True)
 
         self.training = True
 
@@ -84,6 +89,11 @@ class KeypointNet(torch.nn.Module):
         self.cell = 8
         self.upsample = torch.nn.PixelShuffle(upscale_factor=2)
 
+
+        
+
+
+
     def forward(self, x):
         """
         Processes a batch of images.
@@ -104,53 +114,39 @@ class KeypointNet(torch.nn.Module):
         """
         B, _, H, W = x.shape
 
-        x = self.relu(self.conv1a(x))
-        x = self.relu(self.conv1b(x))
-        if self.dropout:
-            x = self.dropout(x)
-        x = self.pool(x)
-        x = self.relu(self.conv2a(x))
-        x = self.relu(self.conv2b(x))
-        if self.dropout:
-            x = self.dropout(x)
-        x = self.pool(x)
-        x = self.relu(self.conv3a(x))
-        skip = self.relu(self.conv3b(x))
-        if self.dropout:
-            skip = self.dropout(skip)
-        x = self.pool(skip)
-        x = self.relu(self.conv4a(x))
-        x = self.relu(self.conv4b(x))
+        # x = self.relu(self.conv1a(x))
+        # x = self.relu(self.conv1b(x))
+        # if self.dropout:
+        #     x = self.dropout(x)
+        # x = self.pool(x)
+        # x = self.relu(self.conv2a(x))
+        # x = self.relu(self.conv2b(x))
+        # if self.dropout:
+        #     x = self.dropout(x)
+        # x = self.pool(x)
+        # x = self.relu(self.conv3a(x))
+        # skip = self.relu(self.conv3b(x))
+        # if self.dropout:
+        #     skip = self.dropout(skip)
+        # x = self.pool(skip)
+        # x = self.relu(self.conv4a(x))
+        # x = self.relu(self.conv4b(x))
+        
+        
+        x = self.hrnet(x)
+
+
+        # print("hrnet x shape: ", x.shape) hrnet x shape:  torch.Size([8, 256, 60, 80])
+
         if self.dropout:
             x = self.dropout(x)
 
         B, _, Hc, Wc = x.shape
 
-        batch = self.relu(self.convDa(x))
-        # if self.dropout:
-        #     score = self.dropout(score)
-        # score = self.convDb(score).sigmoid()
-
-        max_per_sample = torch.max(batch.view(B, -1), dim=1)[0]
-        exp = torch.exp(batch / max_per_sample.view(B, 1, 1, 1))
-        sum_exp = (
-            3 ** 2 *
-            F.avg_pool2d(
-                F.pad(exp, [1] * 4, mode='constant', value=1.),
-                3, stride=1
-            )
-        )
-        local_max_score = exp / sum_exp
-
-        depth_wise_max = torch.max(batch, dim=1)[0]
-        depth_wise_max_score = batch / depth_wise_max.unsqueeze(1)
-
-        all_scores = local_max_score * depth_wise_max_score
-        score = torch.max(all_scores, dim=1)[0]
-
-        score = score / torch.sum(score.view(B, -1), dim=1).view(B, 1, 1)
-
-
+        score = self.relu(self.convDa(x))
+        if self.dropout:
+            score = self.dropout(score)
+        score = self.convDb(score).sigmoid()
 
         border_mask = torch.ones(B, Hc, Wc)
         border_mask[:, 0] = 0
@@ -175,8 +171,6 @@ class KeypointNet(torch.nn.Module):
         coord = coord_un.clone()
         coord[:, 0] = torch.clamp(coord_un[:, 0], min=0, max=W-1)
         coord[:, 1] = torch.clamp(coord_un[:, 1], min=0, max=H-1)
-
-        
 
         feat = self.relu(self.convFa(x))
         if self.dropout:

@@ -43,6 +43,8 @@ def build_descriptor_loss(source_des, target_des, source_points, tar_points, tar
     batch_size, C, _, _ = source_des.shape
     loss, recall = 0., 0.
     margins = 0.2
+    pos_desc = 0.
+    neg_desc = 0.
 
     for cur_ind in range(batch_size):
 
@@ -100,9 +102,178 @@ def build_descriptor_loss(source_des, target_des, source_points, tar_points, tar
         pos_var    = tar_desc
         neg_var    = tar_desc[:, incorrect_first_index]
 
+        pos = anchor_var - pos_var # 256,1064
+        pos = torch.norm(pos,dim=0)
+
+        pos_mean = torch.mean(pos)
+        pos_desc += float(1.0 / batch_size) * pos_mean
+
+        neg = anchor_var - neg_var
+        neg = torch.norm(neg,dim=0)
+
+        neg_mean = torch.mean(neg)
+        neg_desc += float(1.0/batch_size) * neg_mean
+
+
         loss += float(1.0 / batch_size) * torch.nn.functional.triplet_margin_loss(anchor_var.t(), pos_var.t(), neg_var.t(), margin=margins)
 
-    return loss, recall
+    return loss, pos_desc, neg_desc, recall
+
+
+
+### Circle Loss
+
+def build_descriptor_loss_circle(source_des, target_des, source_points, tar_points, tar_points_un, keypoint_mask=None, relax_field=8, eval_only=False):
+    """Desc Head Loss, per-pixel level triplet loss from https://arxiv.org/pdf/1902.11046.pdf..
+    Parameters
+    ----------
+    source_des: torch.Tensor (B,256,H/8,W/8)
+        Source image descriptors.
+    target_des: torch.Tensor (B,256,H/8,W/8)
+        Target image descriptors.
+    source_points: torch.Tensor (B,H/8,W/8,2)
+        Source image keypoints
+    tar_points: torch.Tensor (B,H/8,W/8,2)
+        Target image keypoints
+    tar_points_un: torch.Tensor (B,2,H/8,W/8)
+        Target image keypoints unnormalized
+    eval_only: bool
+        Computes only recall without the loss.
+    Returns
+    -------
+    loss: torch.Tensor
+        Descriptor loss.
+    recall: torch.Tensor
+        Descriptor match recall.
+    """
+    device = source_des.device
+    batch_size, C, _, _ = source_des.shape
+    loss, recall = 0., 0.
+    margins = 0.2
+    pos_desc = 0.
+    neg_desc = 0.
+    # margins = 0.2
+    log_scale = 10
+    pos_margin = 0.1
+    neg_margin = 1.4
+    pos_optimal = pos_margin
+    neg_optimal = neg_margin
+
+    for cur_ind in range(batch_size):
+
+        if keypoint_mask is None:
+            ref_desc = torch.nn.functional.grid_sample(source_des[cur_ind].unsqueeze(0), source_points[cur_ind].unsqueeze(0), align_corners=True).squeeze().view(C, -1)
+            tar_desc = torch.nn.functional.grid_sample(target_des[cur_ind].unsqueeze(0), tar_points[cur_ind].unsqueeze(0), align_corners=True).squeeze().view(C, -1)
+            tar_points_raw = tar_points_un[cur_ind].view(2, -1)
+        else:
+            keypoint_mask_ind = keypoint_mask[cur_ind].squeeze()
+
+            n_feat = keypoint_mask_ind.sum().item()
+            if n_feat < 20:
+                continue
+
+            ref_desc = torch.nn.functional.grid_sample(source_des[cur_ind].unsqueeze(0), source_points[cur_ind].unsqueeze(0), align_corners=True).squeeze()[:, keypoint_mask_ind]
+            tar_desc = torch.nn.functional.grid_sample(target_des[cur_ind].unsqueeze(0), tar_points[cur_ind].unsqueeze(0), align_corners=True).squeeze()[:, keypoint_mask_ind]
+            tar_points_raw = tar_points_un[cur_ind][:, keypoint_mask_ind]
+
+        # Compute dense descriptor distance matrix and find nearest neighbor
+        ref_desc = ref_desc.div(torch.norm(ref_desc, p=2, dim=0))
+        tar_desc = tar_desc.div(torch.norm(tar_desc, p=2, dim=0))
+        dmat = torch.mm(ref_desc.t(), tar_desc)
+        dmat = torch.sqrt(2 - 2 * torch.clamp(dmat, min=-1, max=1))
+
+        # Sort distance matrix
+        dmat_sorted, idx = torch.sort(dmat, dim=1)
+
+        # Compute triplet loss and recall
+        candidates = idx.t() # Candidates, sorted by descriptor distance
+
+        # Get corresponding keypoint positions for each candidate descriptor
+        match_k_x = tar_points_raw[0, candidates]
+        match_k_y = tar_points_raw[1, candidates]
+
+        # True keypoint coordinates
+        true_x = tar_points_raw[0]
+        true_y = tar_points_raw[1]
+
+        # Compute recall as the number of correct matches, i.e. the first match is the correct one
+        correct_matches = (abs(match_k_x[0]-true_x) == 0) & (abs(match_k_y[0]-true_y) == 0)
+        recall += float(1.0 / batch_size) * (float(correct_matches.float().sum()) / float( ref_desc.size(1)))
+
+        if eval_only:
+            continue
+
+        # Compute correct matches, allowing for a few pixels tolerance (i.e. relax_field)
+        correct_idx = (abs(match_k_x - true_x) <= relax_field) & (abs(match_k_y - true_y) <= relax_field)
+        # Get hardest negative example as an incorrect match and with the smallest descriptor distance 
+        incorrect_first = dmat_sorted.t()
+        incorrect_first[correct_idx] = 2.0 # largest distance is at most 2
+        incorrect_first = torch.argmin(incorrect_first, dim=0)
+        incorrect_first_index = candidates.gather(0, incorrect_first.unsqueeze(0)).squeeze()
+
+        anchor_var = ref_desc
+        pos_var    = tar_desc
+        neg_var    = tar_desc[:, incorrect_first_index]
+
+        # torch_triplet = float(1.0 / batch_size) * torch.nn.functional.triplet_margin_loss(anchor_var.t(), pos_var.t(), neg_var.t(), margin=margins)
+        # print("torch triplet: ", torch_triplet)
+        # positive_distance = anchor_var-pos_var
+        # positive_distance = torch.norm(positive_distance,dim=0)
+
+        # negative_distance = anchor_var-neg_var
+        # negative_distance = torch.norm(negative_distance,dim=0)
+
+
+
+        pos = anchor_var - pos_var # 256,1064
+        pos = torch.norm(pos,dim=0)
+
+        pos_mean = torch.mean(pos)
+        pos_desc += float(1.0 / batch_size) * pos_mean
+
+
+        pos_weight = (pos-pos_optimal).detach()
+        pos_weight = torch.max(torch.zeros_like(pos_weight),pos_weight)
+
+        neg = anchor_var - neg_var
+        neg = torch.norm(neg,dim=0)
+
+        neg_mean = torch.mean(neg)
+
+        # my_triplet = float(1.0 / batch_size) * (pos_mean-neg_mean+0.2)
+        # print("my_triplet: ", my_triplet)
+
+        neg_desc += float(1.0 / batch_size) * neg_mean
+
+
+        neg_weight = (neg_optimal-neg).detach()
+        neg_weight = torch.max(torch.zeros_like(neg_weight),neg_weight)
+
+       
+        loss_positive = torch.logsumexp(log_scale * (pos-pos_margin) * pos_weight,dim=0)
+        # print("loss_positive shape: ",loss_positive.shape) # 1064
+        loss_negative = torch.logsumexp(log_scale * (neg_margin-neg) * neg_weight,dim=0)
+
+        loss += float(1.0 / batch_size)*torch.mean (F.softplus(loss_positive+loss_negative) / log_scale)
+        
+        # print("loss: ", loss)
+        # print("loss shape: ",loss.shape)
+
+    return loss, pos_desc,neg_desc,recall
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def warp_homography_batch(sources, homographies):
@@ -162,7 +333,7 @@ class KeypointNetwithIOLoss(torch.nn.Module):
         Extra parameters
     """
     def __init__(
-        self, keypoint_loss_weight=1.0, descriptor_loss_weight=2.0, score_loss_weight=1.0, 
+        self, config,keypoint_loss_weight=1.0, descriptor_loss_weight=2.0, score_loss_weight=1.0, 
         keypoint_net_learning_rate=0.001, with_io=True, use_color=True, do_upsample=True, 
         do_cross=True, descriptor_loss=True, with_drop=True, keypoint_net_type='KeypointNet', **kwargs):
 
@@ -184,11 +355,16 @@ class KeypointNetwithIOLoss(torch.nn.Module):
 
         # Initialize KeypointNet
         if keypoint_net_type == 'KeypointNet':
-            self.keypoint_net = KeypointNet(use_color=use_color, do_upsample=do_upsample, with_drop=with_drop, do_cross=do_cross)
+            self.keypoint_net = KeypointNet(config,use_color=use_color, do_upsample=do_upsample, with_drop=with_drop, do_cross=do_cross)
         elif keypoint_net_type == 'KeypointResnet':
             self.keypoint_net = KeypointResnet(with_drop=with_drop)
         else:
             raise NotImplemented('Keypoint net type not supported {}'.format(keypoint_net_type))
+        
+        # load checkpoint
+        # checkpoint = torch.load('/home/hongbeom/kp2d/data/experiments/kp2d/KeypointNetwithIOLoss_11_09_2021__05_48_53/model.ckpt')
+        # self.keypoint_net.load_state_dict(checkpoint['state_dict'])
+
         self.keypoint_net = self.keypoint_net.cuda()
         self.add_optimizer_params('KeypointNet', self.keypoint_net.parameters(), keypoint_net_learning_rate)
 
@@ -227,7 +403,7 @@ class KeypointNetwithIOLoss(torch.nn.Module):
         """
 
         loss_2d = 0
-
+        metric_loss=0
         if self.training:
 
             B, _, H, W = data['image'].shape
@@ -325,10 +501,10 @@ class KeypointNetwithIOLoss(torch.nn.Module):
 
             #Desc Head Loss, per-pixel level triplet loss from https://arxiv.org/pdf/1902.11046.pdf.
             if self.descriptor_loss:
-                metric_loss, recall_2d = build_descriptor_loss(source_feat, target_feat, source_uv_norm.detach(), source_uv_warped_norm.detach(), source_uv_warped, keypoint_mask=border_mask, relax_field=self.relax_field)
+                metric_loss, pos, neg, recall_2d = build_descriptor_loss(source_feat, target_feat, source_uv_norm.detach(), source_uv_warped_norm.detach(), source_uv_warped, keypoint_mask=border_mask, relax_field=self.relax_field)
                 loss_2d += self.descriptor_loss_weight * metric_loss * 2
             else:
-                _, recall_2d = build_descriptor_loss(source_feat, target_feat, source_uv_norm, source_uv_warped_norm, source_uv_warped, keypoint_mask=border_mask, relax_field=self.relax_field, eval_only=True)
+                _, _,_,recall_2d = build_descriptor_loss(source_feat, target_feat, source_uv_norm, source_uv_warped_norm, source_uv_warped, keypoint_mask=border_mask, relax_field=self.relax_field, eval_only=True)
 
             #Score Head Loss
             target_score_associated = target_score.view(B,Hc*Wc).gather(1, d_uv_l2_min_index).view(B,Hc,Wc).unsqueeze(1)
@@ -429,4 +605,20 @@ class KeypointNetwithIOLoss(torch.nn.Module):
                 self.vis['img_ori'] = np.clip(vis_ori, 0, 255) / 255.
                 self.vis['heatmap'] = np.clip(heatmap * 255, 0, 255) / 255.
 
-        return loss_2d, recall_2d
+            # print("1 ",loss_2d)
+            # print("2 ",metric_loss)
+            # print("3 ",pos)
+            # print("4 ",neg)
+            # print("5 ",recall_2d)
+            # loss_2d = torch.Tensor(loss_2d) 
+            # metric_loss = torch.Tensor(metric_loss)
+            # pos = torch.Tensor(pos)
+            # neg = torch.Tensor(neg)
+            # recall_2d = torch.Tensor(recall_2d)
+            output_list = []
+            output_list.append(loss_2d)
+            output_list.append(metric_loss)
+            output_list.append(pos)
+            output_list.append(neg)
+            output_list.append(recall_2d)
+        return loss_2d
