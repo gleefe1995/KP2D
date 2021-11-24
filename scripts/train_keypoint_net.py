@@ -14,6 +14,10 @@ import torchvision.transforms as transforms
 from torch.utils.data import ConcatDataset, DataLoader
 from tqdm import tqdm
 
+from torch.utils.tensorboard import SummaryWriter
+writer = SummaryWriter()
+
+
 import horovod.torch as hvd
 from kp2d.datasets.patches_dataset import PatchesDataset
 from kp2d.evaluation.evaluate import evaluate_keypoint_net
@@ -29,6 +33,8 @@ def parse_args():
     """Parse arguments for training script"""
     parser = argparse.ArgumentParser(description='KP2D training script')
     parser.add_argument('file', type=str, help='Input file (.ckpt or .yaml)')
+    
+
     args = parser.parse_args()
     assert args.file.endswith(('.ckpt', '.yaml')), \
         'You need to provide a .ckpt of .yaml file'
@@ -66,12 +72,16 @@ def main(file):
     print(config)
     print(config.arch)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     # Initialize horovod
     hvd_init()
     n_threads = int(os.environ.get("OMP_NUM_THREADS", 1))
     torch.set_num_threads(n_threads)    
     torch.backends.cudnn.benchmark = True
     # torch.backends.cudnn.deterministic = True
+
+    torch.backends.cudnn.enabled = True
 
     if world_size() > 1:
         printcolor('-'*18 + 'DISTRIBUTED DATA PARALLEL ' + '-'*18, 'cyan')
@@ -88,17 +98,22 @@ def main(file):
         printcolor(config.model.params, 'red')
 
     # Setup model and datasets/dataloaders
-    model = KeypointNetwithIOLoss(**config.model.params)
+    model = KeypointNetwithIOLoss(config,**config.model.params)
     train_dataset, train_loader = setup_datasets_and_dataloaders(config.datasets)
     printcolor('({}) length: {}'.format("Train", len(train_dataset)))
 
-    model = model.cuda()
-    optimizer = optim.Adam(model.optim_params)
-    compression = hvd.Compression.none  # or hvd.Compression.fp16
-    optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters(), compression=compression)
+    # net = nn.DataParallel(_net).to(device)
+    
+    # model = model.cuda()
+    print("=== Let's use", torch.cuda.device_count(), "GPUs!")
+    model = torch.nn.DataParallel(model).cuda()
+    
+    optimizer = optim.Adam(model.parameters(), lr=config.model.optimizer.learning_rate)
+    # compression = hvd.Compression.none  # or hvd.Compression.fp16
+    # optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters(), compression=compression)
 
     # Synchronize model weights from all ranks
-    hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+    # hvd.broadcast_parameters(model.state_dict(), root_rank=0)
 
     # checkpoint model
     log_path = os.path.join(config.model.checkpoint_path, 'logs')
@@ -198,7 +213,7 @@ def train(config, train_loader, model, optimizer, epoch, summary):
         train_loader.sampler.set_epoch(epoch)
 
     # if args.adjust_lr:
-    adjust_learning_rate(config, optimizer, epoch)
+    # adjust_learning_rate(config, optimizer, epoch)
 
     n_train_batches = len(train_loader)
 
@@ -209,31 +224,61 @@ def train(config, train_loader, model, optimizer, epoch, summary):
                 smoothing=0,
                 disable=(hvd.rank() > 0))
     running_loss = running_recall = grad_norm_disp = grad_norm_pose = grad_norm_keypoint = 0.0
+    desc_loss = 0.0
+    
     train_progress = float(epoch) / float(config.arch.epochs)
 
     log_freq = 10
-
+    pos_desc = 0.0
+    neg_desc = 0.0
     for (i, data) in pbar:
 
         # calculate loss
         optimizer.zero_grad()
         data_cuda = sample_to_cuda(data)
-        loss, recall = model(data_cuda)
+        
+        # loss, metric_loss,pos,neg,recall = model(data_cuda)
+        # out_list = model(data_cuda)
+        loss = model(data_cuda)
+
+        # loss = loss.detach().cpu().numpy()
+        # metric_loss = metric_loss.detach().cpu().numpy()
+        # pos = pos.detach().cpu().numpy()
+        # neg = neg.detach().cpu().numpy()
+        # recall = recall.detach().cpu().numpy()
+        # loss_ = out_list[0]
+        # metric_loss = out_list[1]
+        # pos = out_list[2]
+        # neg = out_list[3]
+        # recall = out_list[4]
+
         loss = hvd.allreduce(loss.mean(), average=True, name='loss')
 
         # compute gradient
         loss.backward()
 
         running_loss += float(loss)
-        running_recall += recall
+        # desc_loss += float(metric_loss)
+        # pos_desc += float(pos)
+        # neg_desc += float(neg)
+        # running_recall += recall
 
         # SGD step
         optimizer.step()
         # pretty progress bar
         if hvd.rank() == 0:
-            pbar.set_description('Train [ E {}, T {:d}, R {:.4f}, R_Avg {:.4f}, L {:.4f}, L_Avg {:.4f}]'.format(
-                epoch, epoch * config.datasets.train.repeat, recall, running_recall / (i + 1), float(loss),
-                float(running_loss) / (i + 1)))
+            # pbar.set_description('Train [ E {}, T {:d}, R {:.4f}, R_Avg {:.4f}, L {:.4f}, L_Avg {:.4f}], Desc_Avg {:.4f}'.format(
+            #     epoch, epoch * config.datasets.train.repeat, recall, running_recall / (i + 1), float(loss),
+            #     float(running_loss) / (i + 1), float(desc_loss) / (i+1)))
+            pbar.set_description('Train [ E {}, L {:.4f}, L_Avg {:.4f}], Desc_Avg {:.4f}, pos_desc {:.4f}, neg_desc {:.4f}'.format(
+                epoch, float(loss),float(running_loss) / (i + 1), float(desc_loss) / (i+1),pos_desc / (i+1), neg_desc / (i+1)))
+            
+            
+            # tensorboard loss
+            writer.add_scalar("Loss/train", loss, epoch*118288//4 + i)
+            # writer.add_scalar("descriptor loss", metric_loss, epoch*118288//4+ i)
+            # writer.add_scalar("pos_desc", pos, epoch*118288//4+ i)
+            # writer.add_scalar("neg_desc", neg, epoch*118288//4+ i)
 
         i += 1
         if i % log_freq == 0:
